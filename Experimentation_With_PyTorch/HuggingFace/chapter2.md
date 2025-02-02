@@ -245,7 +245,7 @@ tokenizer("Using a Transformer network is simple")
 ==>
 
 {
-    `input_ids': [101, 7993, 170, 11303, 1200, 2443, 1110, 3014, 102],
+    'input_ids': [101, 7993, 170, 11303, 1200, 2443, 1110, 3014, 102],
     'token_type_ids': [0, 0, 0, 0, 0, 0, 0, 0, 0],
     'attention_mask': [1, 1, 1, 1, 1, 1, 1, 1, 1]
 }
@@ -273,7 +273,7 @@ Batches
 - Tokenizer doesn't just conver the list of input IDs into a tensor, it also adds a dimension on top of it (list of lists)
 
 example:
-```
+```python
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
