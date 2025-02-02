@@ -6,6 +6,7 @@
 - [Models](#models)
 - [Tokenizers](#tokenizers)
 - [Handling Multiple Sequences](#handling-multiple-sequences)
+- [Putting it All Together](#putting-it-all-together)
 
 ## Questions
 - Can we clarify Sequence length: The length of the numerical representation of the sequence (16 in our example).
@@ -64,6 +65,8 @@
 - Model head takes the high-dimensional vector of hidden states as input and projects them onto a different dimension
 - Usually composed of one or a few linear layers
 - Output of the Transformer model is sent directly to the model head to be processed
+
+- Converts the transformer predictions to a task-specific output
 
 - Embeddings layer converts each input ID in the tokenized input into a vector that represents the associated token
 - Subsequent layers manipulate those vectors using the attention mechanism to produce the final representation of the sentences
@@ -345,3 +348,50 @@ Longer Sequences
     - Can truncate your sequences
 - Models like `Longformer` or `LED` are built if you need long sequences
 - Otherwise can truncate with `sequence = sequence[:max_sequence_length]`
+
+## Putting it All Together
+- When you call `tokenizer` directly on the sentence, you get back inputs that are ready to pass through the model
+    - input ids, padding, truncation, and attention masks
+- `tokenizer` can tokenize a single sentence as well as multiple sequences at a time with no change in the API
+- Can pad according to several objects and truncate
+```python
+# Will pad the sequences up to the maximum sequence length
+model_inputs = tokenizer(sequences, padding="longest")
+
+# Will pad the sequences up to the model max length
+# (512 for BERT or DistilBERT)
+model_inputs = tokenizer(sequences, padding="max_length")
+
+# Will pad the sequences up to the specified max length
+model_inputs = tokenizer(sequences, padding="max_length", max_length=8)
+
+
+sequences = ["I've been waiting for a HuggingFace course my whole life.", "So have I!"]
+
+# Will truncate the sequences that are longer than the model max length
+# (512 for BERT or DistilBERT)
+model_inputs = tokenizer(sequences, truncation=True)
+
+# Will truncate the sequences that are longer than the specified max length
+model_inputs = tokenizer(sequences, max_length=8, truncation=True)
+```
+
+- Can also handle conversion to specific framework of tensors that can be directly sent to the model
+```python
+sequences = ["I've been waiting for a HuggingFace course my whole life.", "So have I!"]
+
+# Returns PyTorch tensors
+model_inputs = tokenizer(sequences, padding=True, return_tensors="pt")
+
+# Returns TensorFlow tensors
+model_inputs = tokenizer(sequences, padding=True, return_tensors="tf")
+
+# Returns NumPy arrays
+model_inputs = tokenizer(sequences, padding=True, return_tensors="np")
+```
+
+- Some models add special tokens at the beginning of the sequence `[CLS]` or at the end `[SEP]`
+- Model was pretrained with those so to get the same results for inference, we need to add them as well
+- `tokenizer` knows which ones are expected and will deal with this for you
+
+
