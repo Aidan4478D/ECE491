@@ -176,3 +176,146 @@ def compute_metrics(eval_preds):
 - The `Trainer` will work out of the box on multiple GPUs or TPUS
 
 ## A Full Training
+- First need a few objects
+    - Dataloaders to iterate over batches
+    - Need to first apply a bit of post-processing to `tokenized_datasets` to take care of things that `Trainer` does automatically
+        - Need to remove columns corresponding to values the model does not expect (like sentence1 and sentence2 columns)
+        - Rename the column `label` to `labels` as the model expects the argument to be named `labels`
+        - Set the format of the dataset so they return PyTorch tensors instead of lists
+
+```python
+tokenized_datasets = tokenized_datasets.remove_columns(["sentence1", "sentence2", "idx"])
+tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
+tokenized_datasets.set_format("torch")
+tokenized_datasets["train"].column_names
+```
+
+- Then define dataloaders
+```python
+from torch.utils.data import DataLoader
+
+train_dataloader = DataLoader(
+    tokenized_datasets["train"], shuffle=True, batch_size=8, collate_fn=data_collator
+)
+eval_dataloader = DataLoader(
+    tokenized_datasets["validation"], batch_size=8, collate_fn=data_collator
+)
+```
+- Now completely finished with data processing
+- All huggingface transformer models will return the loss when `labels` are provided
+
+Then define model, optimizer, and learning rate scheduler
+
+```python
+from transformers import AutoModelForSequenceClassification
+from transformers import AdamW
+from transformers import get_scheduler
+
+model = AutoModelForSequenceClassification.from_pretrained(checkpoint, num_labels=2)
+optimizer = AdamW(model.parameters(), lr=5e-5)
+
+num_epochs = 3
+num_training_steps = num_epochs * len(train_dataloader)
+lr_scheduler = get_scheduler(
+    "linear",
+    optimizer=optimizer,
+    num_warmup_steps=0,
+    num_training_steps=num_training_steps,
+)
+```
+- Optimizer used by `Trainer` is `AdamW` which is the same as Adam but has weight decay regularization
+- Learning rate scheduler is a linear decay from the max value (5e-5) to 0. 
+
+Training Loop
+---
+- Want to use the GPU if we have access to one
+```python
+import torch
+from tqdm.auto import tqdm
+
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+model.to(device)
+
+progress_bar = tqdm(range(num_training_steps))
+
+model.train()
+for epoch in range(num_epochs):
+    for batch in train_dataloader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        outputs = model(**batch)
+        loss = outputs.loss
+        loss.backward()
+
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+        progress_bar.update(1)
+```
+- Also adds a progress bar using the `tqdm` library
+
+Evaluation
+---
+- Metrics can actually accumuatle batches as we go over the prediction loop with `add_batch()`
+- Can get the final results with `metric.compute()`
+
+```python
+import evaluate
+
+metric = evaluate.load("glue", "mrpc")
+model.eval()
+for batch in eval_dataloader:
+    batch = {k: v.to(device) for k, v in batch.items()}
+    with torch.no_grad():
+        outputs = model(**batch)
+
+    logits = outputs.logits
+    predictions = torch.argmax(logits, dim=-1)
+    metric.add_batch(predictions=predictions, references=batch["labels"])
+
+metric.compute()
+```
+
+Accelerate Learning
+---
+- Training loop works fine on a single CPI or GPI
+- Using HuggingFace Accelerate Library we can enable training on multiple GPUs or TPUs
+
+```python
+from accelerate import Accelerator
+from transformers import AdamW, AutoModelForSequenceClassification, get_scheduler
+
+accelerator = Accelerator()
+
+model = AutoModelForSequenceClassification.from_pretrained(checkpoint, num_labels=2)
+optimizer = AdamW(model.parameters(), lr=3e-5)
+
+train_dl, eval_dl, model, optimizer = accelerator.prepare(
+    train_dataloader, eval_dataloader, model, optimizer
+)
+
+num_epochs = 3
+num_training_steps = num_epochs * len(train_dl)
+lr_scheduler = get_scheduler(
+    "linear",
+    optimizer=optimizer,
+    num_warmup_steps=0,
+    num_training_steps=num_training_steps,
+)
+
+progress_bar = tqdm(range(num_training_steps))
+
+model.train()
+for epoch in range(num_epochs):
+    for batch in train_dl:
+        outputs = model(**batch)
+        loss = outputs.loss
+        accelerator.backward(loss)
+
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+        progress_bar.update(1)
+```
+- Main bulk of the work is done in the line that sends the dataloaders, model, and optimizer to `accelarator.prepate()`
+- `accelerate config` will prompt to answer a few questions about config
+
