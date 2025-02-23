@@ -4,8 +4,11 @@
 
 - [Dataset not on Hub](#dataset-not-on-hub)
 - [Slice and Dice Data](#slice-and-dice-data)
+- [Big Data](#big-data)
 
 ## Questions/Comments
+- I think the "Kinny rule of thumb" is interesting - 5-10x as much RAM as the size of your dataset
+- Also datasets as memory mapped files is cool
 
 ## Dataset not on Hub
 - Will often work with data stored on laptop or on a remote server
@@ -186,4 +189,77 @@ Saving a Dataset
     - JSON: `Dataset.to_json()`
 - Arrow format as a fancy table of columns and rows that is optimized for building high-performance applications that process and transport large datasets.
 - Can then use `load_from_disk()` function to reload file back into program
+
+
+## Big Data
+- Treats datasets as memory-mapped files
+- Combats hard drive limits by streaming the entries in a corpus
+
+- The Pile = English text corpus for training large-scale language models
+    - Training corpus is available in 14 GB chunks
+
+- Can measure memory usage in python with `!pip install psutil`
+    - Provides a `Process` class that allows to check memory usage of the current process
+
+- Datasets treats each dataset as a memory-mapped file
+    - Provdes a mapping between RAM and filesystem storage that llows the library to acces and operatoe on elements of the dataset without needing to fully load it into memory
+    - Can be shared across multiple process (like a mapped anonymous region?)
+    - Enables `Dataset.map()` to be parallelized without needing to move or copy the dataset
+
+Streaming datasets
+---
+- Just need to pass the `streaming=True` arg to the `load_dataset()` function
+```python3
+pubmed_dataset_streamed = load_dataset(
+    "json", data_files=data_files, split="train", streaming=True
+)
+```
+- The object returned is an `IterableDataset`
+    - To access these elements you need to iterate over it
+```python3
+next(iter(pubmed_dataset_streamed))
+
+==>
+
+{'meta': {'pmid': 11409574, 'language': 'eng'},
+ 'text': 'Epidemiology of hypoxaemia in children with acute lower respiratory infection.\nTo determine the prevalence of hypoxaemia in children aged under 5 years suffering acute lower respiratory infections (ALRI), the risk factors for hypoxaemia in children under 5 years of age with ALRI, and the association of hypoxaemia with an increased risk of dying in children of the same age ...'}
+```
+- Elements can be processed on the fly using `IterableDataset.map()`
+    - Useful for training of you need to tokenize the inputs
+    - Process is same as in chapter 3, just outputs are returned one by one
+- Can shuffle a streamed dataset using `IterableDataset.shuffle()` 
+    - This only shuffles elements in a pre defined `buffer_size`
+
+```python3
+#select a random sample in the 10,000 example buffer
+shuffled_dataset = pubmed_dataset_streamed.shuffle(buffer_size=10_000, seed=42)
+next(iter(shuffled_dataset))
+```
+
+- Once an example is accessed, its spot in the buffer is filled with the next example in the corpus
+- Can also select elements from a stread dataset using `IterableDataset.take()` and `IterableDataset.skip()`
+```python3
+# take first five examples in the PubMed Abstracts dataset
+dataset_head = pubmed_dataset_streamed.take(5)
+list(dataset_head)
+
+# Skip the first 1,000 examples and include the rest in the training set
+train_dataset = shuffled_dataset.skip(1000)
+# Take the first 1,000 examples for the validation set
+validation_dataset = shuffled_dataset.take(1000)
+```
+- Create training and validation splits from a shuffled dataset
+
+- `interleave_datasets()` function converts a list of `IterableDataset` objects into a single `IterableDataset`
+    - Elements of the new dataset are obtained by alternating among the source examples
+    - Useful when trying to combine large datasets
+```python3 
+from itertools import islice
+from datasets import interleave_datasets
+
+combined_dataset = interleave_datasets([pubmed_dataset_streamed, law_dataset_streamed])
+list(islice(combined_dataset, 2))
+```
+- Use the `islice()` funcition to select the first two examples from the combined dataset
+
 
