@@ -5,10 +5,12 @@
 - [Dataset not on Hub](#dataset-not-on-hub)
 - [Slice and Dice Data](#slice-and-dice-data)
 - [Big Data](#big-data)
+- [Creating your own Dataset](#creating-your-own-dataset)
 
 ## Questions/Comments
 - I think the "Kinny rule of thumb" is interesting - 5-10x as much RAM as the size of your dataset
 - Also datasets as memory mapped files is cool
+- This creating your own dataset is just like github issues tutorial lol
 
 ## Dataset not on Hub
 - Will often work with data stored on laptop or on a remote server
@@ -261,5 +263,155 @@ combined_dataset = interleave_datasets([pubmed_dataset_streamed, law_dataset_str
 list(islice(combined_dataset, 2))
 ```
 - Use the `islice()` funcition to select the first two examples from the combined dataset
+
+## Creating your own Dataset
+- This is just like GitHub issues?
+
+Can get issues through HTTP requests
+```python3
+import requests
+
+url = "https://api.github.com/repos/huggingface/datasets/issues?page=1&per_page=1"
+response = requests.get(url)
+```
+- I'm kinda confused why is this creating a dataset
+
+Fetch and download all repos from a GitHub repo
+```python3
+import time
+import math
+from pathlib import Path
+import pandas as pd
+from tqdm.notebook import tqdm
+
+
+def fetch_issues(
+    owner="huggingface",
+    repo="datasets",
+    num_issues=10_000,
+    rate_limit=5_000,
+    issues_path=Path("."),
+):
+    if not issues_path.is_dir():
+        issues_path.mkdir(exist_ok=True)
+
+    batch = []
+    all_issues = []
+    per_page = 100  # Number of issues to return per page
+    num_pages = math.ceil(num_issues / per_page)
+    base_url = "https://api.github.com/repos"
+
+    for page in tqdm(range(num_pages)):
+        # Query with state=all to get both open and closed issues
+        query = f"issues?page={page}&per_page={per_page}&state=all"
+        issues = requests.get(f"{base_url}/{owner}/{repo}/{query}", headers=headers)
+        batch.extend(issues.json())
+
+        if len(batch) > rate_limit and len(all_issues) < num_issues:
+            all_issues.extend(batch)
+            batch = []  # Flush batch for next time period
+            print(f"Reached GitHub rate limit. Sleeping for one hour ...")
+            time.sleep(60 * 60 + 1)
+
+    all_issues.extend(batch)
+    df = pd.DataFrame.from_records(all_issues)
+    df.to_json(f"{issues_path}/{repo}-issues.jsonl", orient="records", lines=True)
+    print(
+        f"Downloaded all the issues for {repo}! Dataset stored at {issues_path}/{repo}-issues.jsonl"
+    )
+```
+- Will download all issues in batches to avoid exceeding GitHub's limit on the number of requests per hour
+
+Argumenting the Dataset
+---
+- Comments associated with an issue or pull request provide a lot of information
+- There's a `Comments` endpoint with the GitHub REST API
+    - Returns all of the comments associated with an issue number
+
+- Can push to hub just like before
+```python3
+issues_with_comments_dataset.push_to_hub("github-issues")
+```
+- Now anyone can run `load_dataset()` with the repository ID as the `path` argument
+
+Creating a Dataset Card
+---
+- Well documented datasets are more likly to be useful to others
+- Provide context to enable users to decide whether the dataset is relevant ot their task and to evaluate any potential biases in or risks associated with the dataset
+- Again created using a `README.md` file on the hub just like before
+- Template dataset card in the `lewtun/github-issues` dataset repository
+
+
+## Semantic search with FAISS
+- Creating a semantic search engine in this unit
+- One can "pool" the individual embeddings to create a vector represntation for whole sentences, paragraphs, or documents
+- Embeddings can then be used to find similar documents in the corpus by computing dot-product similarity between each embedding and returning the documents with the greatest overlap
+- Asymmetric Semantic Search = because we have a short query whose answer we’d like to find in a longer document, like a an issue comment
+
+Loading and Preparing the dataset
+---
+- Use the `load_dataset()` function "as usual"
+```python3 
+from datasets import load_dataset
+
+issues_dataset = load_dataset("lewtun/github-issues", split="train")
+issues_dataset
+
+==>
+
+Dataset({
+    features: ['url', 'repository_url', 'labels_url', 'comments_url', 'events_url', 'html_url', 'id', 'node_id', 'number', 'title', 'user', 'labels', 'state', 'locked', 'assignee', 'assignees', 'milestone', 'comments', 'created_at', 'updated_at', 'closed_at', 'author_association', 'active_lock_reason', 'pull_request', 'body', 'performed_via_github_app', 'is_pull_request'],
+    num_rows: 2855
+})
+```
+- Since we've specified the default `train` split in `load_dataset()` it returns a `Dataset` instead of a `DatasetDict`
+- First have to filter the pull requests (tend to be rarely used for answering user queries and introduce noise)
+    - Can just use a lambda function and `Datset.filter()`
+
+Keep and remove specific columns:
+```python3
+columns = issues_dataset.column_names
+columns_to_keep = ["title", "body", "html_url", "comments"]
+columns_to_remove = set(columns_to_keep).symmetric_difference(columns)
+issues_dataset = issues_dataset.remove_columns(columns_to_remove)
+issues_dataset
+```
+- To create embeddings, neede to augment each comment with the issue's title and body
+- `DataFrame.explode()` creates a new row fore each element in a list-like column
+
+- Create token embeddings with `AutoModel` class just like chapter 2
+- Want to represent each entry in our GitHub issues corpus as a single vector
+    - Need to "pool" or average token embeddings
+    - Perform CLS pooling = collect last hidden state for the `[CLS]` token
+
+```python3
+def cls_pooling(model_output):
+return model_output.last_hidden_state[:, 0]
+
+def get_embeddings(text_list):
+    encoded_input = tokenizer(
+        text_list, padding=True, truncation=True, return_tensors="pt"
+    )
+    encoded_input = {k: v.to(device) for k, v in encoded_input.items()}
+    model_output = model(**encoded_input)
+    return cls_pooling(model_output)
+```
+- Converst first entry in the corpus to a 768-dimensional vector
+- Can use `Dataset.map()` to apply the `get_embeddings()` function to each row in the corpus
+
+- FAISS = Facebook AI Similarity Search
+    - Library that provides efficient algorithms to quickly search and cluser embedding vectors
+    - Creates a special data structure called an index that allows one to find which embeddings are similar to an input embedding
+
+Just use the `Dataset.add_faiss_index()` function and specify which column of dataset you'd like to index
+```python3
+embeddings_dataset.add_faiss_index(column="embeddings")
+
+# Can now perform queries on this index by doing a nearest neighbor lookup with the `Dataset.get_nearest_examples()` function
+scores, samples = embeddings_dataset.get_nearest_examples(
+    "embeddings", question_embedding, k=5
+)
+```
+- Returns a tuple of scores that rank the overlap between the query and the document
 
 
