@@ -9,6 +9,7 @@
 - [Byte-Pair Encoding](#byte-pair-encoding)
 - [WordPiece Tokenization](#wordpiece-tokenization)
 - [Unigram Tokenization](#unigram-tokenization)
+- [Building a Tokenizer](#building-a-tokenizer)
 
 ## Questions/Comments
 - Is that python generator just using a set?
@@ -793,4 +794,241 @@ def tokenize(text):
 
 
 ## Unigram Tokenization
+- Algorithm used in SentencePiece ==> tokenization algorithm used by AlBERT, T5, mBART, Big Bird, etc.
+- Unlike BPE and WordPiece, it starts from a big vocabulary and removes tokens until it reaches the desired vocab size
+- Build base vocabulary by taking most common substrings in the pre-tokenized words or apply BPE on the initial corpus with a large vocab size
 
+Training Algorithm
+---
+- Algorithm computes a loss over the corpus given the current vocabulary
+- Then for each symbol in the vocab, the alrogithm computes how much the overall loss would increase if the symbol was removed and looks for the symbols that would increast it the least
+    - Those symbols have a lower effect on the overall loss of the corpus so they are in a sense "less needed" and are the best candidates for removal
+    - Is a very costly operation so use the `p` hyperparameter to control the percent of symbols to remove associated with the lowest loss scores
+- Never remove base characters
+- Main part in algorithm is to compute a loss over the corpus and see how it changes when you remove some other tokens in the vocabulary
+
+Tokenization Algorithm
+---
+- Considers each token to be independent of the tokens before it
+    - P(token X | tokens before it) = P(token X)
+    - If we used a unigram language model to generate text, would need to always predict the most common token
+
+Ex. Take the following corpus `("hug", 10), ("pug", 5), ("pun", 12), ("bun", 4), ("hugs", 5)` which has the following substrings `["h", "u", "g", "hu", "ug", "p", "pu", "n", "un", "b", "bu", "s", "hug", "gs", "ugs"]`
+- The probability of a given token is its frequency in the original corpus / sum of all frequencies of all tokens in the vocabulary
+
+If all possible subwords have frequencies `("h", 15) ("u", 36) ("g", 20) ("hu", 15) ("ug", 20) ("p", 17) ("pu", 17) ("n", 16) ("un", 16) ("b", 4) ("bu", 4) ("s", 5) ("hug", 15) ("gs", 5) ("ugs", 5)`
+    - Sum of all frequencies = 210. This P("ug") = 20/210
+
+- To tokenize a given word, look at all possible segmentations into tokens and compute the probability of each according to the Unigram model
+    - Due to independence, the probability is just the product of the probability of each token
+- In general, tokenizations with the least tokens possible will have the highest probability
+    - Corresponds to what we want intuitively: Split a word into the least number of tokens possible
+
+Ex. when tokenizing `pug`
+```python3
+["p", "u", "g"] : 0.000389
+["p", "ug"] : 0.0022676
+["pu", "g"] : 0.0022676
+```
+- `pug` would be tokenized as `["p", "ug"]` or `["pu", "g"]` depending on which is encountered first
+
+- In general it's going to be harder to find all the possible segmentations and compute their probabilities
+    - Use the *Viterbi algorithm* to build a graph to detect the possible segmentations of a given word by saying there is a branch from a character `a` to a character `b` if the subword from `a` to `b` is in the vocab
+    - Then attribute to that branch the probability of the subword
+    - Algorithm determines for each position in the word, the segmentation wit hthe best score that ends at that position
+    - Best score can be found by looping through all the subwords ending at the current position and then using the best tokenization score from the position this subword begins at
+    - Then just have to unroll the path taken to arrive at the end
+
+Ex. Tokenizing `unhug`
+```python3
+Character 0 (u): "u" (score 0.171429)
+Character 1 (n): "un" (score 0.076191)
+Character 2 (h): "un" "h" (score 0.005442)
+Character 3 (u): "un" "hu" (score 0.005442)
+Character 4 (g): "un" "hug" (score 0.005442)
+```
+- Thus `unhug` would be tokenized as `["un", "hug"]`
+
+
+Back to Training
+---
+- Loss is computed by tokenizing every word in the corpus, using the current vocabulary and the Unigram model determined by the frequenceis of each token in the corpus
+- Each word has a score and the loss is the negative log likelihood of the scores (`-log(P(word))`)
+
+Ex. going back to the corpus
+```python3
+# this guy
+("hug", 10), ("pug", 5), ("pun", 12), ("bun", 4), ("hugs", 5)
+
+# The tokenization of each word with their respective score is:
+"hug": ["hug"] (score 0.071428)
+"pug": ["pu", "g"] (score 0.007710)
+"pun": ["pu", "n"] (score 0.006168)
+"bun": ["bu", "n"] (score 0.001451)
+"hugs": ["hug", "s"] (score 0.001701)
+
+# so the loss is:
+10 * (-log(0.071428)) + 5 * (-log(0.007710)) + 12 * (-log(0.006168)) + 4 * (-log(0.001451)) + 5 * (-log(0.001701)) = 169.8
+
+# then need to compute how removing each token affects the loss (tedious so will just do it for two tokens and save the whole process for later
+# removing "hug" will make the loss worse as:
+"hug": ["hu", "g"] (score 0.006802)
+"hugs": ["hu", "gs"] (score 0.001701)
+
+These changes will cause the loss to rise by: 
+- 10 * (-log(0.071428)) + 10 * (-log(0.006802)) = 23.5
+```
+- Therefore the token `pu` will be removed from the vocabm not `hug`
+
+Now there's a whole section here about implementing Unigram. It's a lot of the same as before with WordPiece and BPE so I'm not going to type it all out. Its here if I want to fully implement it though.
+
+
+## Building a Tokenizer
+As we've seen, tokenization requires several steps:
+1. Normalization
+    - Cleanup of text like whitespace removal, removing accents, unicode normalization, etc.
+2. Pre-tokenization
+    - Splitting the input into words
+    - List of words
+3. Running input through the model
+    - Using the pre-tokenized words to produce a sequence of tokens
+4. Post-processing
+    - Adding the special tokens of the tokenizer
+    - Generating the attention mask and token type IDs
+
+Transformers library is built around a central `Tokenizer` class regrouped in submodules
+- `normalizers`: contains all the possible types of `Normalizer`
+- `pre_tokenizers`: contains all the possible types of `PreTokenizer`
+- `models`: contains the various types of `Model` you can use (`BPE`, `WordPiece`, `Unigram`)
+- `trainers`: contains lal the dufferent types of `Trainer` you can use to train your model on a corpus
+- `post_processors`: contains the various types of `PostProcessor` you can use
+- `decoders`: contains the various types of `Decoder` you can use to decode the outputs of the tokenization
+
+Building a WordPiece tokenizer from scratch
+---
+- Use the WikiText dataset and BERT model
+```python3
+from tokenizers import (
+    decoders,
+    models,
+    normalizers,
+    pre_tokenizers,
+    processors,
+    trainers,
+    Tokenizer,
+)
+
+tokenizer = Tokenizer(models.WordPiece(unk_token="[UNK]"))
+```
+- Have to specify the unknown token
+- Can also include the `vocab` of the model and `max_input_chars_per_word`
+
+```python3
+# implement normalizer
+tokenizer.normalizer = normalizers.BertNormalizer(lowercase=True)
+
+# or if you want to do it from scratch:
+tokenizer.normalizer = normalizers.Sequence(
+    [normalizers.NFD(), normalizers.Lowercase(), normalizers.StripAccents()]
+)
+```
+- There's already a BERT normalizer with the classic options set for BERT
+- `lowercase` and `strip_accents` are default, `clean_text` removes all control characters and replaces repeating spaces with a single one
+    - There's also `handle_chinese_chars` which places spaces around Chinese characters
+- `NFD` = Unicode normalizer
+
+```python3
+# Then use a pre tokenizer 
+tokenizer.pre_tokenizer = pre_tokenizers.BertPreTokenizer()
+
+# or build it from scrach
+tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+
+# split on ONLY whitespace
+pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+
+# again can manually build it with sequence
+pre_tokenizer = pre_tokenizers.Sequence(
+    [pre_tokenizers.WhitespaceSplit(), pre_tokenizers.Punctuation()]
+)
+```
+- Again there is a prebuilt `BertPreTokenizer`
+- `Whitespace` splits on whitespace and all characters that aren't alphanumeric or underscore
+    - Technicially it means split on punctuation too
+
+```python3
+special_tokens = ["[UNK]", "[PAD]", "[CLS]", "[SEP]", "[MASK]"]
+trainer = trainers.WordPieceTrainer(vocab_size=25000, special_tokens=special_tokens)
+
+# can use text files to train tokenizer
+tokenizer.model = models.WordPiece(unk_token="[UNK]")
+tokenizer.train(["wikitext-2.txt"], trainer=trainer)
+
+# test tokenizer by calling the encode() method
+encoding = tokenizer.encode("Let's test this tokenizer.")
+print(encoding.tokens)
+```
+- Then run inputs through the model
+- Need to pass the trainer with all the special tokens you intend to use otherwise they won't be added in the vocabulary
+- In addition to `vocab_size` and `special_tokens`, can also set the `min_frequency`=number of times a token must appear to be in the vocab or `continuing_subword_prefix`=want to use something other than `##`
+- `Encoding` conatins all necessary outputs in the tokenizer in its various attributes
+    - `ids`, `type_ids`, `tokens`, `offsets`, `attention_mask`, `special_tokens_mask`, `overflowing`
+
+```python3
+cls_token_id = tokenizer.token_to_id("[CLS]")
+sep_token_id = tokenizer.token_to_id("[SEP]")
+
+tokenizer.post_processor = processors.TemplateProcessing(
+    single=f"[CLS]:0 $A:0 [SEP]:0",
+    pair=f"[CLS]:0 $A:0 [SEP]:0 $B:1 [SEP]:1",
+    special_tokens=[("[CLS]", cls_token_id), ("[SEP]", sep_token_id)],
+)
+
+# again test using encoding to see the tokens produced
+encoding = tokenizer.encode("Let's test this tokenizer...", "on a pair of sentences.")
+print(encoding.tokens)
+print(encoding.type_ids)
+
+==>
+
+['[CLS]', 'let', "'", 's', 'test', 'this', 'tok', '##eni', '##zer', '...', '[SEP]', 'on', 'a', 'pair', 'of', 'sentences', '.', '[SEP]']
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1]
+```
+- Last step is the post-processing
+- Use a `TemplateProcessor` to add special tokens to beginning and end of sentneces
+    - Have to specify how to treat a single sentence and a pair of sentences
+    - Write the speical tokens we want to use (first token = $A, second sentence = $B)
+
+```python3
+tokenizer.decoder = decoders.WordPiece(prefix="##")
+
+tokenizer.decode(encoding.ids)
+
+==>
+
+"let's test this tokenizer... on a pair of sentences."
+```
+- Last step is a decoder to test
+
+To use tokenizer in HuggingFace Transformers, need to wrap it in a `PreTrainedTokenizerFast`
+```python3
+from transformers import PreTrainedTokenizerFast
+
+wrapped_tokenizer = PreTrainedTokenizerFast(
+    tokenizer_object=tokenizer,
+    # tokenizer_file="tokenizer.json", # You can load from the tokenizer file, alternatively
+    unk_token="[UNK]",
+    pad_token="[PAD]",
+    cls_token="[CLS]",
+    sep_token="[SEP]",
+    mask_token="[MASK]",
+)
+
+# if using a specific tokenizer class, need to specify the special tokens that are different from the default ones
+from transformers import BertTokenizerFast
+
+wrapped_tokenizer = BertTokenizerFast(tokenizer_object=tokenizer)
+```
+- Can either pass the tokenizer as a `tokenizer_object` or the tokenizer file you can save (use `tokenizer.save(filename)`) as a `tokenizer_file`
+
+The tutorial then does this for both BPE and Unigram tokenizers. It's a lot of the same stuff so I'm not going to take notes on it but its here if I need.
