@@ -8,6 +8,7 @@
 - [Normalization and Pre-Tokenization](#normalization-and-pretokenization)
 - [Byte-Pair Encoding](#byte-pair-encoding)
 - [WordPiece Tokenization](#wordpiece-tokenization)
+- [Unigram Tokenization](#unigram-tokenization)
 
 ## Questions/Comments
 - Is that python generator just using a set?
@@ -621,3 +622,175 @@ tokenize("This is not a token.")
 
 
 ## WordPiece Tokenization
+- Alrogithm developed by Google to pretrain BERT
+- Similar to BPE in terms of training, but the actual tokenization is done differently
+
+Training Algorithm
+---
+- Starts with a small vocabulary including the special tokens used by the model and initial alphabet
+- Identifies subwords by adding a prefix (like `##` for BERT)
+    - Each word is initially split by adding that prefix to all the characters inside the word
+    - Ex. `word` = `w ##o ##r ##d`
+- Thus, initial alphabet is all the characters present at the beginning of a word and the caracters inside a word with the WordPiece prefix
+- WordPiece also learns merge rules like BPE
+    - The way the pair to be merged is selected using a score
+    - `score = (freq_of_pair)/(freq_of_first_element×freq_of_second_element)`
+    - Algorithm prioritizes the merging of pairs where the individual parts are less frequent in the vocabulary
+    - Ex. even if `un` and `##able` occurs frequently, they won't necessairly merge as `un` and `##able` will likely each appear in a lot of other wirds with high frequency
+
+Tokenization Algorithm
+---
+- Only saves the final vocabulary, not the merge rules learned
+- Finds the longest subword in the vocabulary then splits it
+    - With BPE, would have applied the merges learned in order and tokenized it so the encoding is different
+- When tokenization gets to a stage where it's not possible to find a subword in the vocabulary, the whole word is tokenized as unknown (`[UNK]`)
+    - Different from BPE which would only classify the individual characters not in the vocabulary as unknown
+
+Implementing WordPiece:
+```python3
+corpus = [
+    "This is the Hugging Face Course.",
+    "This chapter is about tokenization.",
+    "This section shows several tokenizer algorithms.",
+    "Hopefully, you will be able to understand how they are trained and generate tokens.",
+]
+
+# need to pre-tokenize corpus into words
+from transformers import AutoTokenizer
+
+# use bert-base-case tokenizer for pre-tokenization
+tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
+
+
+# compute frequencies of each word in the corpus
+from collections import defaultdict
+
+word_freqs = defaultdict(int)
+for text in corpus:
+    words_with_offsets = tokenizer.backend_tokenizer.pre_tokenizer.pre_tokenize_str(text)
+    new_words = [word for word, offset in words_with_offsets]
+    for word in new_words:
+        word_freqs[word] += 1
+
+# create alphabet
+alphabet = []
+for word in word_freqs.keys():
+    if word[0] not in alphabet:
+        alphabet.append(word[0])
+    for letter in word[1:]:
+        if f"##{letter}" not in alphabet:
+            alphabet.append(f"##{letter}")
+
+alphabet.sort()
+
+# want to add special tokens used by the model a the beginning of the vocab
+vocab = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"] + alphabet.copy()
+
+
+# need to split each word with all the letters not prefixed by ##
+splits = {
+    word: [c if i == 0 else f"##{c}" for i, c in enumerate(word)]
+    for word in word_freqs.keys()
+}
+
+
+
+# compute score for each pair
+def compute_pair_scores(splits):
+    letter_freqs = defaultdict(int)
+    pair_freqs = defaultdict(int)
+    for word, freq in word_freqs.items():
+        split = splits[word]
+        if len(split) == 1:
+            letter_freqs[split[0]] += freq
+            continue
+        for i in range(len(split) - 1):
+            pair = (split[i], split[i + 1])
+            letter_freqs[split[i]] += freq
+            pair_freqs[pair] += freq
+        letter_freqs[split[-1]] += freq
+
+    scores = {
+        pair: freq / (letter_freqs[pair[0]] * letter_freqs[pair[1]])
+        for pair, freq in pair_freqs.items()
+    }
+    return scores
+
+
+# look at a part of dict after initial splits
+pair_scores = compute_pair_scores(splits)
+for i, key in enumerate(pair_scores.keys()):
+    print(f"{key}: {pair_scores[key]}")
+    if i >= 5:
+        break
+
+# find pair with the best score
+best_pair = ""
+max_score = None
+for pair, score in pair_scores.items():
+    if max_score is None or max_score < score:
+        best_pair = pair
+        max_score = score
+
+
+# need to apply the merge in splits dict
+def merge_pair(a, b, splits):
+    for word in word_freqs:
+        split = splits[word]
+        if len(split) == 1:
+            continue
+        i = 0
+        while i < len(split) - 1:
+            if split[i] == a and split[i + 1] == b:
+                merge = a + b[2:] if b.startswith("##") else a + b
+                split = split[:i] + [merge] + split[i + 2 :]
+            else:
+                i += 1
+        splits[word] = split
+    return splits
+
+
+# need to loop until we have learned all the merges we want 
+vocab_size = 70
+while len(vocab) < vocab_size:
+    scores = compute_pair_scores(splits)
+    best_pair, max_score = "", None
+    for pair, score in scores.items():
+        if max_score is None or max_score < score:
+            best_pair = pair
+            max_score = score
+    splits = merge_pair(*best_pair, splits)
+    new_token = (
+        best_pair[0] + best_pair[1][2:]
+        if best_pair[1].startswith("##")
+        else best_pair[0] + best_pair[1]
+    )
+    vocab.append(new_token)
+
+
+# Then to tokenize a new text, pre-tokenize it, split it, then apply tokenization algorithm onto each word
+def encode_word(word):
+    tokens = []
+    while len(word) > 0:
+        i = len(word)
+        while i > 0 and word[:i] not in vocab:
+            i -= 1
+        if i == 0:
+            return ["[UNK]"]
+        tokens.append(word[:i])
+        word = word[i:]
+        if len(word) > 0:
+            word = f"##{word}"
+    return tokens
+
+# tokenize a text
+def tokenize(text):
+    pre_tokenize_result = tokenizer._tokenizer.pre_tokenizer.pre_tokenize_str(text)
+    pre_tokenized_text = [word for word, offset in pre_tokenize_result]
+    encoded_words = [encode_word(word) for word in pre_tokenized_text]
+    return sum(encoded_words, [])
+```
+
+
+## Unigram Tokenization
+
