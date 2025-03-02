@@ -6,6 +6,8 @@
 - [Fast tokenizers in NER](#fast-tokenizers)
 - [Fast tokenizers in the QA pipeline](#fast-tokenizers-in-the-qa-pipeline)
 - [Normalization and Pre-Tokenization](#normalization-and-pretokenization)
+- [Byte-Pair Encoding](#byte-pair-encoding)
+- [WordPiece Tokenization](#wordpiece-tokenization)
 
 ## Questions/Comments
 - Is that python generator just using a set?
@@ -447,3 +449,175 @@ SentencePiece
 - SentnecePiece is reversible tokenization
     - There is no special treatment of spaces so decoding the tokenis is done sumply but concating them and replacing the `_` with ` `. 
     - Results in the normlaized text
+
+
+## Byte-Pair Encoding
+- Initially developed as an algorithm to compress texts but then used by OpenAI for tokenization when pretraining GPT modles
+
+Training Algorithm
+---
+- Starts by computing the unique set of words used in the corpus (after normalization and pre-tokenization)
+- Builds vocabulary by taking all the symbols used to write those words
+    - Base vocabulary will contain all ASCII characters and probably some Unicode characters
+    - If tokenizing token is not in training corpus, character will be converted to the `[UNK]` token
+    - Byte-level BPE = look at words being written with Unicode characters but with bytes
+        - Base vocabulary has a small size (256) but every character will still be included and not end up being converted to `[UNK]`
+- After getting the base vocabulary, add new tokens until the desired vocabulary size is reached by learning merges
+    - There are rules to merge two elements of th existing vocabulary together into a new one
+
+**The key**:
+- At any step during tokenizer training, the BPE alrogithm will search for the most frequent pair of existing tokens
+- The most frequent pair is the one that will be merged and we rinse and repeat for the next step
+
+Example:
+```python3
+# assume text had words with the following frequencies
+("hug", 10), ("pug", 5), ("pun", 12), ("bun", 4), ("hugs", 5)
+
+# first split each word into characters
+("h" "u" "g", 10), ("p" "u" "g", 5), ("p" "u" "n", 12), ("b" "u" "n", 4), ("h" "u" "g" "s", 5)
+
+# then look at pairs (ug is most frequent so merge those)
+Vocabulary: ["b", "g", "h", "n", "p", "s", "u", "ug"]
+Corpus: ("h" "ug", 10), ("p" "ug", 5), ("p" "u" "n", 12), ("b" "u" "n", 4), ("h" "ug" "s", 5)
+
+# next merge is ('h' and "ug")
+Vocabulary: ["b", "g", "h", "n", "p", "s", "u", "ug", "un", "hug"]
+Corpus: ("hug", 10), ("p" "ug", 5), ("p" "un", 12), ("b" "un", 4), ("hug" "s", 5)
+
+# then continue until desired vocabulary size is reached
+```
+
+Tokenization Algorithm and Implementing BPE
+---
+- New inputs are tokenized by applying the following steps:
+    1. Normalization
+    2. Pre-tokenization
+    3. Splitting words into individual characters
+    4. Applying merge rules learned in order on those splits
+
+Assuming the same word set as before,
+```python3
+("u", "g") -> "ug"
+("u", "n") -> "un"
+("h", "ug") -> "hug"
+```
+- `bug` = `b` + `ug`
+- `mug` = `[UNK]` + `ug`
+- `thug` = `[UNK]` + `hug`
+
+Now implementing BPE:
+```python3
+from collections import defaultdict
+
+# compute word frequencies
+word_freqs = defaultdict(int)
+
+for text in corpus:
+    words_with_offsets = tokenizer.backend_tokenizer.pre_tokenizer.pre_tokenize_str(text)
+    new_words = [word for word, offset in words_with_offsets]
+    for word in new_words:
+        word_freqs[word] += 1
+
+# compute base vocabulary formed by all the characters used in the corpus
+alphabet = []
+
+for word in word_freqs.keys():
+    for letter in word:
+        if letter not in alphabet:
+            alphabet.append(letter)
+alphabet.sort()
+
+# add special end of text token at the beginnig
+vocab = ["<|endoftext|>"] + alphabet.copy()
+
+# split each word into characters to be able to start training
+splits = {word: [c for c in word] for word in word_freqs.keys()}
+
+# compute the frequency of each pair
+def compute_pair_freqs(splits):
+    pair_freqs = defaultdict(int)
+    for word, freq in word_freqs.items():
+        split = splits[word]
+        if len(split) == 1:
+            continue
+        for i in range(len(split) - 1):
+            pair = (split[i], split[i + 1])
+            pair_freqs[pair] += freq
+    return pair_freqs
+
+# find most frequent pair
+best_pair = ""
+max_freq = None
+
+for pair, freq in pair_freqs.items():
+    if max_freq is None or max_freq < freq:
+        best_pair = pair
+        max_freq = freq
+
+# merge the most frequent pair
+def merge_pair(a, b, splits):
+    for word in word_freqs:
+        split = splits[word]
+        if len(split) == 1:
+            continue
+
+        i = 0
+        while i < len(split) - 1:
+            if split[i] == a and split[i + 1] == b:
+                split = split[:i] + [a + b] + split[i + 2 :]
+            else:
+                i += 1
+        splits[word] = split
+    return splits
+
+# now train for a vocab size of 50
+vocab_size = 50
+
+while len(vocab) < vocab_size:
+    pair_freqs = compute_pair_freqs(splits)
+    best_pair = ""
+    max_freq = None
+    for pair, freq in pair_freqs.items():
+        if max_freq is None or max_freq < freq:
+            best_pair = pair
+            max_freq = freq
+    splits = merge_pair(*best_pair, splits)
+    merges[best_pair] = best_pair[0] + best_pair[1]
+    vocab.append(best_pair[0] + best_pair[1])
+```
+- Vocab is composed of the special token, the initial alphabet, and all of the results of the mergesw
+- Using `train_new_from_iterator()` on the same corpus won't result in the exact same vocabulary
+    - When there is a choice of the most frequent pair, we select the first one encountered
+    - The HuggingFace Tokenizers library sepects the first one based on its inner IDs
+
+Now apply new tokenizer to text
+```python3
+def tokenize(text):
+    pre_tokenize_result = tokenizer._tokenizer.pre_tokenizer.pre_tokenize_str(text)
+    pre_tokenized_text = [word for word, offset in pre_tokenize_result]
+    splits = [[l for l in word] for word in pre_tokenized_text]
+    for pair, merge in merges.items():
+        for idx, split in enumerate(splits):
+            i = 0
+            while i < len(split) - 1:
+                if split[i] == pair[0] and split[i + 1] == pair[1]:
+                    split = split[:i] + [merge] + split[i + 2 :]
+                else:
+                    i += 1
+            splits[idx] = split
+
+    return sum(splits, [])
+
+tokenize("This is not a token.")
+
+==>
+
+['This', 'Ġis', 'Ġ', 'n', 'o', 't', 'Ġa', 'Ġtoken', '.']
+```
+- This implementation will throw an error if there's an unknown character since we didn't do anything to handle them
+- Did not include all possible bytes in the initital vocabulary
+- Make sure to handle it when doing it fr!
+
+
+## WordPiece Tokenization
